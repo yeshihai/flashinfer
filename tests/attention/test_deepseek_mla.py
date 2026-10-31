@@ -1155,6 +1155,111 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
     )
 
 
+@pytest.mark.parametrize("head_dim_kpe", [0, HEAD_DIM_KPE])
+@pytest.mark.parametrize("kv_len", [64, 256])
+def test_batch_mla_fp8_kv_folded_scale_matches_bf16_reference(head_dim_kpe, kv_len):
+    """A per-tensor FP8 KV scale can be folded into the logits and the output
+    instead of scaling every dequantized element (noPE MLA, or
+    kpe_scale == ckv_scale). The folded kernel must match the BF16 reference
+    run on the dequantized FP8 KV within BF16 precision."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+
+    torch.manual_seed(0xF01D)
+    device = torch.device("cuda:0")
+    batch_size, num_heads, qo_len, page_size = 2, 16, 1, 16
+
+    q_nope = (
+        torch.randn(
+            batch_size * qo_len,
+            num_heads,
+            HEAD_DIM_CKV,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    q_pe = (
+        torch.randn(
+            batch_size * qo_len,
+            num_heads,
+            head_dim_kpe,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+
+    num_pages = batch_size * kv_len // page_size
+    ckv_fp32 = torch.randn(num_pages, page_size, HEAD_DIM_CKV, device=device) * 0.1
+    kpe_fp32 = torch.randn(num_pages, page_size, head_dim_kpe, device=device) * 0.1
+    amax = ckv_fp32.abs().max().item()
+    if head_dim_kpe > 0:
+        amax = max(amax, kpe_fp32.abs().max().item())
+    scale = amax / 448.0
+    ckv_fp8 = (ckv_fp32 / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    kpe_fp8 = (kpe_fp32 / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    ckv_ref = _ref_dequant_to_bf16(ckv_fp8, scale)
+    kpe_ref = _ref_dequant_to_bf16(kpe_fp8, scale)
+
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * qo_len
+    )
+    kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * (
+        kv_len // page_size
+    )
+    kv_len_arr = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    kv_indices = torch.arange(0, num_pages, dtype=torch.int32, device=device)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + head_dim_kpe)
+
+    o_bf16 = _run_mla(
+        "fa3",
+        q_nope,
+        q_pe,
+        ckv_ref,
+        kpe_ref,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads=num_heads,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        head_dim_kpe=head_dim_kpe,
+    )
+    o_fp8 = _run_mla(
+        "fa3",
+        q_nope,
+        q_pe,
+        ckv_fp8,
+        kpe_fp8,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads=num_heads,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        ckv_scale=scale,
+        kpe_scale=scale,
+        head_dim_kpe=head_dim_kpe,
+    )
+
+    torch.cuda.synchronize()
+    diff = (o_fp8.float() - o_bf16.float()).abs()
+    max_diff = diff.max().item()
+    assert max_diff < 1.5e-2, (
+        f"head_dim_kpe={head_dim_kpe} kv_len={kv_len}: "
+        f"max_abs_diff={max_diff:.4e} mean={diff.mean().item():.4e}"
+    )
+
+
 @pytest.mark.parametrize("ckv_magnitude", [0.01, 0.1, 1.0])
 @pytest.mark.parametrize("kpe_magnitude", [0.01, 0.1, 1.0])
 def test_batch_mla_fp8_kv_scale_sensitivity(ckv_magnitude, kpe_magnitude):

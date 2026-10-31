@@ -357,8 +357,8 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16_impl(
     uint32_t packed_kv_bound) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
-  const uint32_t thread_id = threadIdx.x - KTraits::NUM_COPY_THREADS;
-  const uint32_t num_threads = KTraits::NUM_QK_THREADS;
+  const uint32_t thread_id = threadIdx.x;
+  const uint32_t num_threads = KTraits::NUM_THREADS;
 
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
@@ -442,10 +442,9 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(
   using DTypeKV = typename KTraits::DTypeKV;
   static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
                 "repack_fp8_kv_to_bf16 only supports DTypeKV == __nv_fp8_e4m3");
-  // Only consumer warpgroup does the dequant; producer wg early-returns.
-  // The helper has no internal barriers, so this is safe — the surrounding
-  // __syncthreads() at the call sites covers cross-wg synchronization.
-  if (threadIdx.x < KTraits::NUM_COPY_THREADS) return;
+  // Both warpgroups cooperatively dequant, splitting the elements by
+  // threadIdx.x. Call sites bracket it with the paired __syncthreads(), so
+  // the producer sees the TMA-completed FP8 stage before reading it.
   if (!apply_scale) {
     repack_fp8_kv_to_bf16_impl<0, KTraits>(smem_storage, stage_idx, ckv_scale, kpe_scale,
                                            ckv_scale_arr, row_base, kv_indices, block_size,
@@ -1006,11 +1005,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         ++smem_pipe_write_kv;
 
         if constexpr (KTraits::USE_KV_REPACK) {
-          // d1: pair with consumer's s1 (consumer is at __syncthreads_pre_dequant
-          // right after its own consumer_wait). Producer participates as a
-          // pass-through here — only the consumer warpgroup writes the BF16
-          // staging buffer below.
+          // d1: pair with consumer's s1. The producer dequants its half of the
+          // staging buffer below; the read stage lags one tile behind the tile
+          // loaded above, so the PV below consumes tile kv_tile_idx + 1.
           __syncthreads();
+          repack_fp8_kv_to_bf16<KTraits>(
+              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
+              variant.ckv_scale_arr,
+              block_iter_base + static_cast<uint32_t>(kv_tile_idx + 1) * KTraits::CTA_TILE_KV,
+              kv_indices, block_size, kv_indptr * block_size + kv_len, !fold_kv_scale);
           // d2: pair with consumer's s2 (post-dequant). Once we cross this
           // barrier, the BF16 staging buffer has the current stage's data and
           // is safe to read in the PV WGMMA below.
@@ -1039,11 +1042,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
       if (has_kv) {
         if constexpr (KTraits::USE_KV_REPACK) {
-          // d1: pair with consumer's s1 (consumer is at __syncthreads_pre_dequant
-          // right after its own consumer_wait). Producer participates as a
-          // pass-through here — only the consumer warpgroup writes the BF16
-          // staging buffer below.
+          // d1: pair with consumer's s1. The producer dequants its half of the
+          // staging buffer below; the read stage lags one tile behind the tile
+          // loaded above, so the PV below consumes tile kv_tile_idx + 1.
           __syncthreads();
+          repack_fp8_kv_to_bf16<KTraits>(
+              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
+              variant.ckv_scale_arr,
+              block_iter_base + static_cast<uint32_t>(kv_tile_idx + 1) * KTraits::CTA_TILE_KV,
+              kv_indices, block_size, kv_indptr * block_size + kv_len, !fold_kv_scale);
           // d2: pair with consumer's s2 (post-dequant). Once we cross this
           // barrier, the BF16 staging buffer has the current stage's data and
           // is safe to read in the PV WGMMA below.
@@ -1127,8 +1134,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         if constexpr (KTraits::USE_KV_REPACK) {
           // s1: pair with producer's d1 (matches per-iter __syncthreads count).
           __syncthreads();
-          // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
-          // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
+          // Producer wg dequants the other half of the staging buffer between
+          // the same d1/d2 pair.
           repack_fp8_kv_to_bf16<KTraits>(
               &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
               variant.ckv_scale_arr,
@@ -1176,8 +1183,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         if constexpr (KTraits::USE_KV_REPACK) {
           // s1: pair with producer's d1 (matches per-iter __syncthreads count).
           __syncthreads();
-          // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
-          // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
+          // Producer wg dequants the other half of the staging buffer between
+          // the same d1/d2 pair.
           repack_fp8_kv_to_bf16<KTraits>(
               &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
               variant.ckv_scale_arr,
@@ -1222,8 +1229,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         if constexpr (KTraits::USE_KV_REPACK) {
           // s1: pair with producer's d1 (matches per-iter __syncthreads count).
           __syncthreads();
-          // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
-          // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
+          // Producer wg dequants the other half of the staging buffer between
+          // the same d1/d2 pair.
           repack_fp8_kv_to_bf16<KTraits>(
               &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
               variant.ckv_scale_arr,

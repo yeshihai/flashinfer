@@ -252,7 +252,7 @@ def _generated_fa_shared_bytes(backend, ckv, kpe, fp8_kv, smem_per_sm):
     return max(q_bytes + kv_bytes + repack + 2 * 64 * 4, 64 * ckv * 2)
 
 
-_FA_MAX_WORK_ITEMS = 16384
+_FA_MAX_WORK_ITEMS = 65536
 
 
 def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):

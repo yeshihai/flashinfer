@@ -1780,7 +1780,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                    "Internal Error: merge_cta_counter should be less than or equal to num_sm, "
                    "please report this bug to the developers");
 
-  int max_total_num_works = 16384;  // NOTE(Zihao): adjust it later
+  int max_total_num_works = 65536;  // NOTE(Zihao): adjust it later
 
   std::vector<IdType> work_indptr_vec(num_clusters + 1, 0);
   for (uint32_t i = 0; i < num_clusters; ++i) {

@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_ATTENTION_HOPPER_HEADER_CUH_
 #define FLASHINFER_ATTENTION_HOPPER_HEADER_CUH_
 #include <cuda.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/cutlass.h>
@@ -215,6 +216,68 @@ struct WGMMA_ASYNC_SS<__nv_bfloat16, float, 64, 256, 16, TransposeA, TransposeB,
   static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
     constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
     MMA_64x256x16_F32BF16BF16_SS<TransposeA, TransposeB, scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_128(d_frag), scale_d);
+  }
+};
+
+// FP8 (e4m3) WGMMA is TN-only: both operands must be K-major. The transposed
+// variants used by the 16-bit path have no FP8 counterpart.
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 16, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                "e4m3 WGMMA requires K-major operands");
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x16x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_8(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 32, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                "e4m3 WGMMA requires K-major operands");
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x32x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_16(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 64, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                "e4m3 WGMMA requires K-major operands");
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x64x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_32(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 128, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                "e4m3 WGMMA requires K-major operands");
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x128x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_64(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 256, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                "e4m3 WGMMA requires K-major operands");
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x256x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
         desc_a, desc_b, EXPAND_FRAG_ARGS_128(d_frag), scale_d);
   }
 };

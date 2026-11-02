@@ -18,6 +18,7 @@
 #include <cooperative_groups.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cuda/std/limits>
 #include <sstream>
 
@@ -126,7 +127,8 @@ struct HopperSharedStorageQKVO {
 
 template <bool CAUSAL_, uint32_t NUM_STAGES_, uint32_t HEAD_DIM_CKV_, uint32_t HEAD_DIM_KPE_,
           uint32_t CTA_TILE_Q_, uint32_t CTA_TILE_KV_, typename DTypeQ_, typename DTypeKV_,
-          typename DTypeO_, typename IdType_, bool USE_FP8_ATTN_ = false>
+          typename DTypeO_, typename IdType_, bool USE_FP8_ATTN_ = false,
+          bool USE_FP8_TWO_TERM_ = false, bool USE_FP8_TWO_TERM_P_ = false>
 struct HopperKernelTraits
     : KernelTraits<CAUSAL_, NUM_STAGES_, /*QK_SHARD_=*/false, HEAD_DIM_CKV_, HEAD_DIM_KPE_,
                    CTA_TILE_Q_, CTA_TILE_KV_, DTypeQ_, DTypeKV_, DTypeO_, IdType_> {
@@ -179,6 +181,19 @@ struct HopperKernelTraits
   // both operands are K-major (FP8 WGMMA is TN-only). Same gate as QK for now.
   static constexpr bool USE_FP8_PV = USE_FP8_QK;
   static constexpr uint32_t NUM_MMA_KV_FP8 = CTA_TILE_KV_ / 32;
+  // Accuracy mode: two-term Q (hi + lo e4m3 with one shared per-row scale).
+  // The residual term is quantized with the same scale, so the logits scale
+  // is folded once; QK issues two WGMMA calls per K step.
+  static constexpr bool USE_FP8_TWO_TERM = USE_FP8_QK && USE_FP8_TWO_TERM_;
+  // Byte offset of the second fp8 Q tile inside q_smem.nope (hi then lo).
+  static constexpr uint32_t Q_TILE_BYTES = CTA_TILE_Q_ * HEAD_DIM_CKV_;
+  static constexpr uint32_t NUM_Q_TILE_B128 = CTA_TILE_Q_ * (HEAD_DIM_CKV_ / 16);
+  // Two-term P: the lo tile lives in the unused second half of q_smem.nope
+  // (single-term Q only), 8KB per KV pipeline stage.
+  static constexpr bool USE_FP8_TWO_TERM_P = USE_FP8_PV && USE_FP8_TWO_TERM_P_;
+  static_assert(!(USE_FP8_TWO_TERM && USE_FP8_TWO_TERM_P),
+                "two-term Q and two-term P cannot share q_smem.nope");
+  static constexpr uint32_t P_TILE_BYTES = CTA_TILE_Q_ * 128;
   using MainloopPipeline = cutlass::PipelineAsync<NUM_STAGES_>;
   using SharedStorage =
       HopperSharedStorageQKVO<MainloopPipeline, NUM_STAGES_, CTA_TILE_Q_, CTA_TILE_KV_,
@@ -303,6 +318,7 @@ __device__ __forceinline__ void quantize_q_fp8(typename KTraits::SharedStorage* 
     if (lane_idx == 0) {
       smem_storage->q_scale[row] = amax > 0.0f ? amax / kFp8Max : 1.0f;
     }
+    const uint32_t off = get_swizzle_offset<KTraits::SWIZZLE_MODE_CKV, DST_STRIDE>(row, lane_idx);
     b128_t out;
     __nv_fp8_e4m3* out8 = reinterpret_cast<__nv_fp8_e4m3*>(&out);
     float vals[8];
@@ -316,12 +332,29 @@ __device__ __forceinline__ void quantize_q_fp8(typename KTraits::SharedStorage* 
       vals[i] = __bfloat162float(h1[i]) * inv_scale;
     }
     vec_cast<__nv_fp8_e4m3, float>::template cast<8>(out8 + 8, vals);
-    dst[get_swizzle_offset<KTraits::SWIZZLE_MODE_CKV, DST_STRIDE>(row, lane_idx)] = out;
+    dst[off] = out;
+    if constexpr (KTraits::USE_FP8_TWO_TERM) {
+      // Residual against the same per-row scale: one extra fp8 tile.
+      b128_t out_lo;
+      __nv_fp8_e4m3* lo8 = reinterpret_cast<__nv_fp8_e4m3*>(&out_lo);
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i) {
+        vals[i] = __bfloat162float(h0[i]) * inv_scale - static_cast<float>(out8[i]);
+      }
+      vec_cast<__nv_fp8_e4m3, float>::template cast<8>(lo8, vals);
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i) {
+        vals[i] = __bfloat162float(h1[i]) * inv_scale - static_cast<float>(out8[8 + i]);
+      }
+      vec_cast<__nv_fp8_e4m3, float>::template cast<8>(lo8 + 8, vals);
+      dst[KTraits::NUM_Q_TILE_B128 + off] = out_lo;
+    }
   }
 
   barrier_sync(KTraits::NUM_QK_THREADS, NamedBarriers::kConsumerDequantBegin);
   constexpr uint32_t NUM_B128 = CTA_TILE_Q * DST_STRIDE;
-  for (uint32_t i = tid; i < NUM_B128; i += KTraits::NUM_QK_THREADS) {
+  constexpr uint32_t NUM_TILES = KTraits::USE_FP8_TWO_TERM ? 2 : 1;
+  for (uint32_t i = tid; i < NUM_TILES * NUM_B128; i += KTraits::NUM_QK_THREADS) {
     src[i] = dst[i];
   }
   barrier_sync(KTraits::NUM_QK_THREADS, NamedBarriers::kConsumerDequantEnd);
@@ -683,9 +716,12 @@ __device__ __forceinline__ void compute_mla_qk_fp8(typename KTraits::SharedStora
   static_assert(KTraits::HEAD_DIM_KPE == 0, "compute_mla_qk_fp8 supports no-PE MLA only");
   using DTypeFP8 = __nv_fp8_e4m3;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
+  DTypeFP8* q_ptr = reinterpret_cast<DTypeFP8*>(smem_storage->q_smem.nope);
   auto desc_q = make_smem_desc<KTraits::SWIZZLE_MODE_Q_NOPE, /*leading_byte_offset=*/16,
-                               /*stride_byte_offset=*/HEAD_DIM_CKV * 8, DTypeFP8>(
-      reinterpret_cast<DTypeFP8*>(smem_storage->q_smem.nope));
+                               /*stride_byte_offset=*/HEAD_DIM_CKV * 8, DTypeFP8>(q_ptr);
+  auto desc_q_lo = make_smem_desc<KTraits::SWIZZLE_MODE_Q_NOPE, /*leading_byte_offset=*/16,
+                                  /*stride_byte_offset=*/HEAD_DIM_CKV * 8, DTypeFP8>(
+      q_ptr + KTraits::NUM_Q_TILE_B128 * 16);
   auto desc_k = make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
                                /*stride_byte_offset=*/HEAD_DIM_CKV * 8, DTypeFP8>(
       reinterpret_cast<DTypeFP8*>(smem_storage->kv_o_smem[stage_idx].ckv));
@@ -701,12 +737,21 @@ __device__ __forceinline__ void compute_mla_qk_fp8(typename KTraits::SharedStora
     } else {
       wgmma::op</*init=*/false>(desc_q, desc_k, s_frag);
     }
+    if constexpr (KTraits::USE_FP8_TWO_TERM) {
+      wgmma::op</*init=*/false>(desc_q_lo, desc_k, s_frag);
+    }
     if ((mma_d_ckv + 1) % 4 == 0) {
       desc_q += 64 - 6;
       desc_k += 64 - 6;
+      if constexpr (KTraits::USE_FP8_TWO_TERM) {
+        desc_q_lo += 64 - 6;
+      }
     } else {
       desc_q += 2;
       desc_k += 2;
+      if constexpr (KTraits::USE_FP8_TWO_TERM) {
+        desc_q_lo += 2;
+      }
     }
   }
   warpgroup_commit_batch();
@@ -778,6 +823,11 @@ __device__ __forceinline__ void compute_mla_pv_fp8(typename KTraits::SharedStora
   auto desc_p = make_smem_desc<KTraits::SWIZZLE_MODE_P, /*leading_byte_offset=*/16,
                                /*stride_byte_offset=*/V_ROW_BYTES * 8, DTypeFP8>(
       reinterpret_cast<DTypeFP8*>(smem_storage->kv_o_smem[stage_idx].p));
+  DTypeFP8* p_lo_ptr = reinterpret_cast<DTypeFP8*>(
+      reinterpret_cast<uint8_t*>(smem_storage->q_smem.nope) + KTraits::Q_TILE_BYTES +
+      stage_idx * KTraits::P_TILE_BYTES);
+  auto desc_p_lo = make_smem_desc<KTraits::SWIZZLE_MODE_P, /*leading_byte_offset=*/16,
+                                  /*stride_byte_offset=*/V_ROW_BYTES * 8, DTypeFP8>(p_lo_ptr);
   auto desc_v = make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
                                /*stride_byte_offset=*/V_ROW_BYTES * 8, DTypeFP8>(
       reinterpret_cast<DTypeFP8*>(smem_storage->ckv_bf16) +
@@ -789,6 +839,10 @@ __device__ __forceinline__ void compute_mla_pv_fp8(typename KTraits::SharedStora
 #pragma unroll
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV_FP8; ++mma_kv) {
     wgmma::op</*init=*/false>(desc_p, desc_v, o_frag);
+    if constexpr (KTraits::USE_FP8_TWO_TERM_P) {
+      wgmma::op</*init=*/false>(desc_p_lo, desc_v, o_frag);
+      desc_p_lo += 2;
+    }
     desc_p += 2;
     desc_v += 2;
   }
@@ -916,6 +970,8 @@ __device__ __forceinline__ void write_p_fp8(typename KTraits::SharedStorage* sme
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   uint8_t* p_base = reinterpret_cast<uint8_t*>(smem_storage->kv_o_smem[stage_idx].p);
+  uint8_t* p_lo_base = reinterpret_cast<uint8_t*>(smem_storage->q_smem.nope) +
+                       KTraits::Q_TILE_BYTES + stage_idx * KTraits::P_TILE_BYTES;
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
     const uint32_t row = warp_idx_in_wg * 16 + lane_idx / 4 + 8 * j;
@@ -924,14 +980,34 @@ __device__ __forceinline__ void write_p_fp8(typename KTraits::SharedStorage* sme
       uint8_t* chunk = p_base + get_swizzle_offset<KTraits::SWIZZLE_MODE_P, 8>(row, c) * 16;
       const uint32_t reg0 = 8 * c + 2 * j;
       const uint32_t reg1 = reg0 + 4;
-      *reinterpret_cast<uint16_t*>(chunk + 2 * (lane_idx % 4)) =
-          static_cast<uint16_t>(__nv_cvt_float2_to_fp8x2(
-              make_float2(s_frag[reg0] * kScale, s_frag[reg0 + 1] * kScale), __NV_SATFINITE,
-              __NV_E4M3));
-      *reinterpret_cast<uint16_t*>(chunk + 8 + 2 * (lane_idx % 4)) =
-          static_cast<uint16_t>(__nv_cvt_float2_to_fp8x2(
-              make_float2(s_frag[reg1] * kScale, s_frag[reg1 + 1] * kScale), __NV_SATFINITE,
-              __NV_E4M3));
+      const float v00 = s_frag[reg0] * kScale;
+      const float v01 = s_frag[reg0 + 1] * kScale;
+      const float v10 = s_frag[reg1] * kScale;
+      const float v11 = s_frag[reg1 + 1] * kScale;
+      const uint32_t hi0 = __nv_cvt_float2_to_fp8x2(make_float2(v00, v01), __NV_SATFINITE,
+                                                    __NV_E4M3);
+      const uint32_t hi1 = __nv_cvt_float2_to_fp8x2(make_float2(v10, v11), __NV_SATFINITE,
+                                                    __NV_E4M3);
+      *reinterpret_cast<uint16_t*>(chunk + 2 * (lane_idx % 4)) = static_cast<uint16_t>(hi0);
+      *reinterpret_cast<uint16_t*>(chunk + 8 + 2 * (lane_idx % 4)) = static_cast<uint16_t>(hi1);
+      if constexpr (KTraits::USE_FP8_TWO_TERM_P) {
+        // Residuals against the same x256 scale, stored in the dead second half
+        // of q_smem.nope (8KB per stage).
+        const __nv_fp8_e4m3* h0 = reinterpret_cast<const __nv_fp8_e4m3*>(&hi0);
+        const __nv_fp8_e4m3* h1 = reinterpret_cast<const __nv_fp8_e4m3*>(&hi1);
+        const uint32_t lo0 = __nv_cvt_float2_to_fp8x2(
+            make_float2(v00 - static_cast<float>(h0[0]), v01 - static_cast<float>(h0[1])),
+            __NV_SATFINITE, __NV_E4M3);
+        const uint32_t lo1 = __nv_cvt_float2_to_fp8x2(
+            make_float2(v10 - static_cast<float>(h1[0]), v11 - static_cast<float>(h1[1])),
+            __NV_SATFINITE, __NV_E4M3);
+        uint8_t* lo_chunk =
+            p_lo_base + get_swizzle_offset<KTraits::SWIZZLE_MODE_P, 8>(row, c) * 16;
+        *reinterpret_cast<uint16_t*>(lo_chunk + 2 * (lane_idx % 4)) =
+            static_cast<uint16_t>(lo0);
+        *reinterpret_cast<uint16_t*>(lo_chunk + 8 + 2 * (lane_idx % 4)) =
+            static_cast<uint16_t>(lo1);
+      }
     }
   }
 }
@@ -1662,6 +1738,25 @@ cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint
         params.ckv_scale_arr == nullptr &&
         (HEAD_DIM_KPE == 0 || params.kpe_scale == params.ckv_scale);
     if (fold_kv_scale) {
+      const char* two_term_p_env = std::getenv("FLASHINFER_MLA_FP8_TWO_TERM_P");
+      if (two_term_p_env != nullptr && two_term_p_env[0] == '1') {
+        using Fp8TwoTermPTraits =
+            hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
+                                       CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType,
+                                       /*USE_FP8_ATTN_=*/true, /*USE_FP8_TWO_TERM_=*/false,
+                                       /*USE_FP8_TWO_TERM_P_=*/true>;
+        launch(hopper::BatchMLAPageAttentionHopperKernel<Fp8TwoTermPTraits, Params>);
+        return cudaSuccess;
+      }
+      const char* two_term_env = std::getenv("FLASHINFER_MLA_FP8_TWO_TERM");
+      if (two_term_env != nullptr && two_term_env[0] == '1') {
+        using Fp8TwoTermTraits =
+            hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
+                                       CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType,
+                                       /*USE_FP8_ATTN_=*/true, /*USE_FP8_TWO_TERM_=*/true>;
+        launch(hopper::BatchMLAPageAttentionHopperKernel<Fp8TwoTermTraits, Params>);
+        return cudaSuccess;
+      }
       using Fp8Traits =
           hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
                                      CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType,

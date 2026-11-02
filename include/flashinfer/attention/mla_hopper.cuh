@@ -114,6 +114,9 @@ struct HopperSharedStorageQKVO {
         };
         alignas(16) DTypeO o[CTA_TILE_Q * HEAD_DIM_CKV];
       };
+      // Two-term P residual tile. A single buffer is enough: the consumer
+      // waits for the PV WGMMA of tile i before writing tile i+1.
+      alignas(1024) uint8_t p_lo[CTA_TILE_Q * 128];
       alignas(16) float o_scale[CTA_TILE_Q];
       alignas(16) float m[CTA_TILE_Q];
       alignas(16) float d[CTA_TILE_Q];
@@ -191,8 +194,8 @@ struct HopperKernelTraits
   // Two-term P: the lo tile lives in the unused second half of q_smem.nope
   // (single-term Q only), 8KB per KV pipeline stage.
   static constexpr bool USE_FP8_TWO_TERM_P = USE_FP8_PV && USE_FP8_TWO_TERM_P_;
-  static_assert(!(USE_FP8_TWO_TERM && USE_FP8_TWO_TERM_P),
-                "two-term Q and two-term P cannot share q_smem.nope");
+  // Two-term Q and two-term P can be combined: the P residual tile lives in
+  // its own top-level buffer, not in q_smem.nope.
   static constexpr uint32_t P_TILE_BYTES = CTA_TILE_Q_ * 128;
   using MainloopPipeline = cutlass::PipelineAsync<NUM_STAGES_>;
   using SharedStorage =
@@ -823,9 +826,7 @@ __device__ __forceinline__ void compute_mla_pv_fp8(typename KTraits::SharedStora
   auto desc_p = make_smem_desc<KTraits::SWIZZLE_MODE_P, /*leading_byte_offset=*/16,
                                /*stride_byte_offset=*/V_ROW_BYTES * 8, DTypeFP8>(
       reinterpret_cast<DTypeFP8*>(smem_storage->kv_o_smem[stage_idx].p));
-  DTypeFP8* p_lo_ptr = reinterpret_cast<DTypeFP8*>(
-      reinterpret_cast<uint8_t*>(smem_storage->q_smem.nope) + KTraits::Q_TILE_BYTES +
-      stage_idx * KTraits::P_TILE_BYTES);
+  DTypeFP8* p_lo_ptr = reinterpret_cast<DTypeFP8*>(smem_storage->p_lo);
   auto desc_p_lo = make_smem_desc<KTraits::SWIZZLE_MODE_P, /*leading_byte_offset=*/16,
                                   /*stride_byte_offset=*/V_ROW_BYTES * 8, DTypeFP8>(p_lo_ptr);
   auto desc_v = make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
@@ -970,8 +971,7 @@ __device__ __forceinline__ void write_p_fp8(typename KTraits::SharedStorage* sme
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   uint8_t* p_base = reinterpret_cast<uint8_t*>(smem_storage->kv_o_smem[stage_idx].p);
-  uint8_t* p_lo_base = reinterpret_cast<uint8_t*>(smem_storage->q_smem.nope) +
-                       KTraits::Q_TILE_BYTES + stage_idx * KTraits::P_TILE_BYTES;
+  uint8_t* p_lo_base = reinterpret_cast<uint8_t*>(smem_storage->p_lo);
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
     const uint32_t row = warp_idx_in_wg * 16 + lane_idx / 4 + 8 * j;
@@ -1738,6 +1738,16 @@ cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint
         params.ckv_scale_arr == nullptr &&
         (HEAD_DIM_KPE == 0 || params.kpe_scale == params.ckv_scale);
     if (fold_kv_scale) {
+      const char* two_term_both_env = std::getenv("FLASHINFER_MLA_FP8_TWO_TERM_BOTH");
+      if (two_term_both_env != nullptr && two_term_both_env[0] == '1') {
+        using Fp8TwoTermBothTraits =
+            hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
+                                       CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType,
+                                       /*USE_FP8_ATTN_=*/true, /*USE_FP8_TWO_TERM_=*/true,
+                                       /*USE_FP8_TWO_TERM_P_=*/true>;
+        launch(hopper::BatchMLAPageAttentionHopperKernel<Fp8TwoTermBothTraits, Params>);
+        return cudaSuccess;
+      }
       const char* two_term_p_env = std::getenv("FLASHINFER_MLA_FP8_TWO_TERM_P");
       if (two_term_p_env != nullptr && two_term_p_env[0] == '1') {
         using Fp8TwoTermPTraits =

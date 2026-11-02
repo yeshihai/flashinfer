@@ -1452,7 +1452,23 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         d[j] = smem_storage.d[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
       }
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
-      finalize_m_<KTraits>(variant, m);
+      if constexpr (KTraits::USE_FP8_QK) {
+        // The FP8 QK path folds a per-row Q scale into the logits scale
+        // (see update_md_). finalize_m_ only applies the global scale, which
+        // would leave the partial LSE inconsistent with the per-chunk d for
+        // split-KV merges.
+        const uint32_t fl_lane = cutlass::canonical_lane_idx();
+        const uint32_t fl_warp = cutlass::canonical_warp_idx() % 4;
+#pragma unroll
+        for (uint32_t j = 0; j < 2; ++j) {
+          if (m[j] != -math::inf) {
+            m[j] *= variant.sm_scale_log2 *
+                    smem_storage.q_scale[fl_warp * 16 + j * 8 + fl_lane / 4];
+          }
+        }
+      } else {
+        finalize_m_<KTraits>(variant, m);
+      }
       PROFILER_EVENT_START(variant, ProfileEventType::kWriteO);
       write_o<false, KTraits>(
           &smem_storage, final_o + q_indptr * o_stride_n,
@@ -1653,7 +1669,23 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         }
       }
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
-      finalize_m_<KTraits>(variant, m);
+      if constexpr (KTraits::USE_FP8_QK) {
+        // The FP8 QK path folds a per-row Q scale into the logits scale
+        // (see update_md_). finalize_m_ only applies the global scale, which
+        // would leave the partial LSE inconsistent with the per-chunk d for
+        // split-KV merges.
+        const uint32_t fl_lane = cutlass::canonical_lane_idx();
+        const uint32_t fl_warp = cutlass::canonical_warp_idx() % 4;
+#pragma unroll
+        for (uint32_t j = 0; j < 2; ++j) {
+          if (m[j] != -math::inf) {
+            m[j] *= variant.sm_scale_log2 *
+                    smem_storage.q_scale[fl_warp * 16 + j * 8 + fl_lane / 4];
+          }
+        }
+      } else {
+        finalize_m_<KTraits>(variant, m);
+      }
       barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kMDReady);
       PROFILER_EVENT_START(variant, ProfileEventType::kWriteO);
       write_o<true, KTraits>(

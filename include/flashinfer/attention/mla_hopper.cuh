@@ -353,8 +353,7 @@ template <int SCALE_MODE, typename KTraits>
 __device__ __forceinline__ void repack_fp8_kv_to_bf16_impl(
     typename KTraits::SharedStorage* smem_storage, const uint32_t stage_idx, float ckv_scale,
     float kpe_scale, const float* ckv_scale_arr, uint32_t row_base,
-    const typename KTraits::IdType* kv_indices, uint_fastdiv block_size,
-    uint32_t packed_kv_bound) {
+    const typename KTraits::IdType* kv_indices, uint_fastdiv block_size, uint32_t packed_kv_bound) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
   const uint32_t thread_id = threadIdx.x;
@@ -677,12 +676,14 @@ __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* sm
 }
 
 template <bool write_lse, typename KTraits>
-__device__ __forceinline__ void write_o(
-    typename KTraits::SharedStorage* smem_storage, typename KTraits::DTypeO* final_o,
-    float* final_lse, typename KTraits::DTypeO* partial_o, float* partial_lse, float(*o_frag),
-    float* m, float* d, const uint32_t o_stride_n, const uint32_t o_stride_h, const uint32_t q_len,
-    const uint32_t packed_offset, const uint_fastdiv& num_heads, const bool& return_lse_base_on_e,
-    float o_scale_kv = 1.0f) {
+__device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_storage,
+                                        typename KTraits::DTypeO* final_o, float* final_lse,
+                                        typename KTraits::DTypeO* partial_o, float* partial_lse,
+                                        float(*o_frag), float* m, float* d,
+                                        const uint32_t o_stride_n, const uint32_t o_stride_h,
+                                        const uint32_t q_len, const uint32_t packed_offset,
+                                        const uint_fastdiv& num_heads,
+                                        const bool& return_lse_base_on_e, float o_scale_kv = 1.0f) {
   using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
@@ -848,9 +849,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   typename KTraits::AttentionVariant variant(params, blockIdx.y, smem);
   // FP8 KV with a per-tensor scale can be folded into the softmax scale and
   // the output instead of scaling every dequantized KV element.
-  const bool fold_kv_scale =
-      KTraits::USE_KV_REPACK && params.ckv_scale_arr == nullptr &&
-      (KTraits::HEAD_DIM_KPE == 0 || params.kpe_scale == params.ckv_scale);
+  const bool fold_kv_scale = KTraits::USE_KV_REPACK && params.ckv_scale_arr == nullptr &&
+                             (KTraits::HEAD_DIM_KPE == 0 || params.kpe_scale == params.ckv_scale);
   if (fold_kv_scale) {
     variant.sm_scale_log2 *= params.ckv_scale;
   }

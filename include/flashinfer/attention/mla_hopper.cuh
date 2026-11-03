@@ -1005,6 +1005,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         ++smem_pipe_write_kv;
 
         if constexpr (KTraits::USE_KV_REPACK) {
+          // Acquire the FP8 stage before this warpgroup reads it. The paired
+          // CTA barrier then makes the acquired stage visible to both wgs.
+          consumer_wait(pipeline_kv, smem_pipe_read_kv);
           // d1: pair with consumer's s1. The producer dequants its half of the
           // staging buffer below; the read stage lags one tile behind the tile
           // loaded above, so the PV below consumes tile kv_tile_idx + 1.
@@ -1024,7 +1027,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
         PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
-        consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        if constexpr (!KTraits::USE_KV_REPACK) {
+          consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        }
         __syncthreads();
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
@@ -1042,6 +1047,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
       if (has_kv) {
         if constexpr (KTraits::USE_KV_REPACK) {
+          // Acquire the FP8 stage before this warpgroup reads it. The paired
+          // CTA barrier then makes the acquired stage visible to both wgs.
+          consumer_wait(pipeline_kv, smem_pipe_read_kv);
           // d1: pair with consumer's s1. The producer dequants its half of the
           // staging buffer below; the read stage lags one tile behind the tile
           // loaded above, so the PV below consumes tile kv_tile_idx + 1.
@@ -1061,7 +1069,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
         PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
-        consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        if constexpr (!KTraits::USE_KV_REPACK) {
+          consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        }
         __syncthreads();
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
